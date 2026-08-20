@@ -1,223 +1,128 @@
 /**
- * Deploy a compiled smart contract to the Hedera Testnet.
+ * Deploy the compiled Voting contract to the Hedera Testnet.
  *
  * Usage:
- *   node deploy.js <artifact-or-bin-file> [--gas 200000] [--memo "..."] [ABI-encoded constructor args...]
+ *   node deploy.js [artifact] --arg-string-array "A,B,C" --arg-address-array "0.0.x,0.0.y"
  *
- * Examples:
- *   node deploy.js ./artifacts/MyContract.json
- *   node deploy.js ./build/MyContract.bin --gas 300000
- *   node deploy.js ./artifacts/MyToken.json --arg-string "MyToken" --arg-string "MTK" --arg-uint256 1000000
+ * Example:
+ *   node deploy.js Voting.json \
+ *     --arg-string-array "Pizza,Pasta,Salad" \
+ *     --arg-address-array "0.0.10116894"
  *
- * Requires a .env file (see .env.example) with:
- *   HEDERA_OPERATOR_ID   e.g. 0.0.12345
- *   HEDERA_OPERATOR_KEY  ECDSA or ED25519 private key (hex or DER)
+ * The contract id is written to deployment.json, so call.js finds it automatically.
+ * Requires a .env file (see .env.example).
  */
 
 import fs from "node:fs";
-import path from "node:path";
-import "dotenv/config";
-import {
-  Client,
-  PrivateKey,
-  AccountId,
-  ContractCreateFlow,
-  ContractFunctionParameters,
-  Hbar,
-} from "@hashgraph/sdk";
+import { ContractCreateFlow, ContractFunctionParameters } from "@hashgraph/sdk";
+import { makeTestnetClient, resolveAccountAddresses } from "./hedera.js";
 
-/* ------------------------------------------------------------------ */
-/* 1. Read the compiled bytecode                                       */
-/* ------------------------------------------------------------------ */
+const DEFAULT_ARTIFACT = "Voting.json";
+const DEPLOYMENT_FILE = "deployment.json";
+const GAS = 1_500_000;
 
-/**
- * Accepts either:
- *   - a raw .bin file containing the hex bytecode, or
- *   - a compiler artifact JSON (Hardhat / Foundry / solc) that carries the
- *     bytecode under one of the common field names.
- */
-function loadBytecode(filePath) {
-  const raw = fs.readFileSync(filePath, "utf8").trim();
+/** Split a comma separated list, treating "" as an empty list. */
+const splitList = (raw) => raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 
-  // Raw .bin / .hex file: just the bytecode string.
-  if (filePath.endsWith(".bin") || filePath.endsWith(".hex")) {
-    return normalizeHex(raw);
+function parseArgs(argv) {
+  const opts = { artifact: DEFAULT_ARTIFACT, topics: null, notAllowed: null };
+
+  for (let i = 2; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--arg-string-array") opts.topics = splitList(argv[++i] ?? "");
+    else if (token === "--arg-address-array") opts.notAllowed = splitList(argv[++i] ?? "");
+    else if (!token.startsWith("--")) opts.artifact = token;
+    else throw new Error(`Unknown argument: ${token}`);
   }
 
-  // JSON artifact from solc / Hardhat / Foundry.
-  const artifact = JSON.parse(raw);
-
-  const candidate =
-    artifact.bytecode ??                       // solc / Hardhat
-    artifact.bytecode?.object ??               // some solc variants
-    artifact.deployedBytecode?.object ??
-    artifact.data?.bytecode?.object ??         // solc standard-json output
-    artifact.evm?.bytecode?.object;            // solc contract output
-
-  if (!candidate) {
+  if (opts.topics === null || opts.notAllowed === null) {
     throw new Error(
-      `Could not find a bytecode field in ${filePath}. ` +
-      `Expected one of: bytecode, bytecode.object, evm.bytecode.object.`
+      'Both constructor arguments are required. Use --arg-string-array "A,B,C" and ' +
+        '--arg-address-array "0.0.x" (pass "" for no blocked accounts).'
     );
   }
-  return normalizeHex(typeof candidate === "string" ? candidate : candidate.object);
+  if (opts.topics.length === 0) throw new Error("At least one topic is required.");
+  return opts;
 }
 
-function normalizeHex(hex) {
+/**
+ * Read the creation bytecode from the artifact.
+ *
+ * Accepts the compact form committed here ({ abi, bytecode }) and the full
+ * artifact Remix exports ({ data: { bytecode: { object } } }). The runtime
+ * bytecode is never used as a fallback: deploying it produces a contract that
+ * reverts on every call.
+ */
+function loadBytecode(artifact) {
+  const candidate = artifact.bytecode ?? artifact.data?.bytecode?.object;
+  const hex = (typeof candidate === "string" ? candidate : candidate?.object) ?? "";
   const stripped = hex.startsWith("0x") ? hex.slice(2) : hex;
-  if (stripped.length === 0) {
-    throw new Error("Bytecode is empty.");
-  }
-  if (!/^[0-9a-fA-F]+$/.test(stripped)) {
-    throw new Error("Bytecode is not valid hex.");
+
+  if (!/^[0-9a-fA-F]+$/.test(stripped) || stripped.length === 0) {
+    throw new Error("No valid creation bytecode in the artifact. Did the contract compile?");
   }
   return stripped;
 }
 
-/* ------------------------------------------------------------------ */
-/* 2. Parse CLI args (gas, memo, constructor parameters)               */
-/* ------------------------------------------------------------------ */
-
-function parseArgs(argv) {
-  const [, , file, ...rest] = argv;
-  if (!file) {
-    console.error(
-      "Usage: node deploy.js <artifact-or-bin-file> [--gas N] [--memo TEXT] " +
-      "[--arg-string V] [--arg-address 0.0.x|0x..] [--arg-uint256 N] [--arg-bool true|false]"
-    );
-    process.exit(1);
-  }
-
-  const opts = { file, gas: 200_000, memo: "", constructorArgs: [] };
-
-  for (let i = 0; i < rest.length; i++) {
-    const token = rest[i];
-    switch (token) {
-      case "--gas":
-        opts.gas = Number(rest[++i]);
-        break;
-      case "--memo":
-        opts.memo = rest[++i];
-        break;
-      case "--arg-string":
-        opts.constructorArgs.push(["addString", rest[++i]]);
-        break;
-      case "--arg-address":
-        opts.constructorArgs.push(["addAddress", toEvmAddress(rest[++i])]);
-        break;
-      case "--arg-uint256":
-        opts.constructorArgs.push(["addUint256", rest[++i]]);
-        break;
-      case "--arg-bool":
-        opts.constructorArgs.push(["addBool", rest[++i] === "true"]);
-        break;
-      case "--arg-string-array":
-        opts.constructorArgs.push(["addStringArray", rest[++i].split(",")]);
-        break;
-      case "--arg-address-array":
-        opts.constructorArgs.push(["addAddressArray", rest[++i].split(",").map(a => toEvmAddress(a.trim()))]);
-        break;
-      default:
-        throw new Error(`Unknown argument: ${token}`);
-    }
-  }
-  return opts;
-}
-
-/** Convert a Hedera 0.0.x id or a 0x EVM address to a solidity address. */
-function toEvmAddress(value) {
-  if (value.startsWith("0x")) return value;
-  return AccountId.fromString(value).toSolidityAddress();
-}
-
-/** Build the ContractFunctionParameters object from parsed constructor args. */
-function buildConstructorParams(argSpecs) {
-  if (argSpecs.length === 0) return null;
-  const params = new ContractFunctionParameters();
-  for (const [method, value] of argSpecs) {
-    params[method](value);
-  }
-  return params;
-}
-
-/* ------------------------------------------------------------------ */
-/* 3. Build the Hedera client for Testnet                              */
-/* ------------------------------------------------------------------ */
-
-/** Parse a private key that may be DER-encoded or a raw ECDSA/ED25519 hex string. */
-function parsePrivateKey(raw) {
-  try {
-    return PrivateKey.fromStringDer(raw);
-  } catch {
-    // Fall back to raw ECDSA hex (Hedera Portal "HEX Encoded Private Key").
-    return PrivateKey.fromStringECDSA(raw);
-  }
-}
-
-function makeTestnetClient() {
-  const operatorId = process.env.HEDERA_OPERATOR_ID;
-  const operatorKeyRaw = process.env.HEDERA_OPERATOR_KEY;
-
-  if (!operatorId || !operatorKeyRaw) {
-    throw new Error(
-      "Please set HEDERA_OPERATOR_ID and HEDERA_OPERATOR_KEY in your environment (.env)."
-    );
-  }
-
-  // Works for both ECDSA and ED25519 keys, DER- or hex-encoded.
-  const operatorKey = parsePrivateKey(operatorKeyRaw);
-
-  const client = Client.forTestnet();
-  client.setOperator(AccountId.fromString(operatorId), operatorKey);
-  // Cap accidental fee spend; adjust as needed.
-  client.setDefaultMaxTransactionFee(new Hbar(20));
-  return client;
-}
-
-/* ------------------------------------------------------------------ */
-/* 4. Deploy                                                           */
-/* ------------------------------------------------------------------ */
-
 async function main() {
   const opts = parseArgs(process.argv);
-  const bytecode = loadBytecode(path.resolve(opts.file));
-  const client = makeTestnetClient();
+  const artifact = JSON.parse(fs.readFileSync(opts.artifact, "utf8"));
+  const bytecode = loadBytecode(artifact);
 
-  console.log(`Deploying ${path.basename(opts.file)} to Hedera Testnet ...`);
-  console.log(`  gas:  ${opts.gas}`);
-  if (opts.memo) console.log(`  memo: ${opts.memo}`);
-
-  // ContractCreateFlow uploads the bytecode to a file (chunked automatically
-  // for large contracts) and creates the contract in one convenient step.
-  const flow = new ContractCreateFlow()
-    .setGas(opts.gas)
-    .setBytecode(bytecode);
-
-  if (opts.memo) flow.setContractMemo(opts.memo);
-
-  const params = buildConstructorParams(opts.constructorArgs);
-  if (params) flow.setConstructorParameters(params);
-
-  const txResponse = await flow.execute(client);
-  const receipt = await txResponse.getReceipt(client);
-
-  const contractId = receipt.contractId;
-  if (!contractId) {
-    throw new Error(`Deployment failed with status: ${receipt.status.toString()}`);
+  // an account id expands to every EVM address it can appear as, so the check
+  // against msg.sender matches whichever form Hedera uses for that account
+  const addresses = [];
+  for (const entry of opts.notAllowed) {
+    addresses.push(...(await resolveAccountAddresses(entry)));
   }
+  const notAllowed = [...new Set(addresses)];
 
-  const evmAddress = contractId.toSolidityAddress();
+  const { client, accountId } = makeTestnetClient(1);
 
-  console.log("\n✅ Contract deployed successfully");
-  console.log(`  Contract ID : ${contractId.toString()}`);
-  console.log(`  EVM address : 0x${evmAddress}`);
-  console.log(`  HashScan    : https://hashscan.io/testnet/contract/${contractId.toString()}`);
+  console.log("Deploying Voting to Hedera Testnet ...");
+  console.log(`  operator    : ${accountId.toString()}`);
+  console.log(`  topics      : ${JSON.stringify(opts.topics)}`);
+  console.log(`  not allowed : ${JSON.stringify(notAllowed)}`);
 
-  client.close();
-  return contractId.toString();
+  try {
+    // ContractCreateFlow uploads the bytecode to a file and creates the contract
+    // in one step, chunking automatically for large contracts
+    const response = await new ContractCreateFlow()
+      .setGas(GAS)
+      .setBytecode(bytecode)
+      .setConstructorParameters(
+        new ContractFunctionParameters().addStringArray(opts.topics).addAddressArray(notAllowed)
+      )
+      .execute(client);
+
+    const contractId = (await response.getReceipt(client)).contractId;
+    if (!contractId) throw new Error("Deployment failed, no contract id in the receipt.");
+
+    fs.writeFileSync(
+      DEPLOYMENT_FILE,
+      JSON.stringify(
+        {
+          contractId: contractId.toString(),
+          deployedBy: accountId.toString(),
+          deployedAt: new Date().toISOString(),
+          topics: opts.topics,
+          notAllowed,
+        },
+        null,
+        2
+      )
+    );
+
+    console.log("\nContract deployed successfully");
+    console.log(`  Contract ID : ${contractId.toString()}`);
+    console.log(`  HashScan    : https://hashscan.io/testnet/contract/${contractId.toString()}`);
+    console.log(`  Saved to    : ${DEPLOYMENT_FILE}`);
+  } finally {
+    client.close();
+  }
 }
 
 main().catch((err) => {
-  console.error("\n❌ Deployment error:", err.message ?? err);
+  console.error("\nDeployment error:", err.message ?? err);
   process.exit(1);
 });

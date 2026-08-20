@@ -1,7 +1,7 @@
 {
-  "name": "hedera-deploy",
+  "name": "oth-voting",
   "version": "1.0.0",
-  "description": "Deploy a compiled smart contract to the Hedera Testnet via the Hedera JS SDK and call it.",
+  "description": "Voting smart contract for the OTH summer school course test, deployed to the Hedera Testnet via the Hedera JS SDK.",
   "type": "module",
   "main": "deploy.js",
   "scripts": {
@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@hashgraph/sdk": "^2.62.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.0"
   }
 }

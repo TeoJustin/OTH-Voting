@@ -1,0 +1,8 @@
+node_modules/
+
+# private keys, never commit these
+.env
+.env.bak
+
+# backups of the original files
+*.orig
