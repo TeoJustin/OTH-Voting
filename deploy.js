@@ -57,7 +57,7 @@ function loadBytecode(filePath) {
   if (!candidate) {
     throw new Error(
       `Could not find a bytecode field in ${filePath}. ` +
-        `Expected one of: bytecode, bytecode.object, evm.bytecode.object.`
+      `Expected one of: bytecode, bytecode.object, evm.bytecode.object.`
     );
   }
   return normalizeHex(typeof candidate === "string" ? candidate : candidate.object);
@@ -83,7 +83,7 @@ function parseArgs(argv) {
   if (!file) {
     console.error(
       "Usage: node deploy.js <artifact-or-bin-file> [--gas N] [--memo TEXT] " +
-        "[--arg-string V] [--arg-address 0.0.x|0x..] [--arg-uint256 N] [--arg-bool true|false]"
+      "[--arg-string V] [--arg-address 0.0.x|0x..] [--arg-uint256 N] [--arg-bool true|false]"
     );
     process.exit(1);
   }
@@ -110,6 +110,12 @@ function parseArgs(argv) {
         break;
       case "--arg-bool":
         opts.constructorArgs.push(["addBool", rest[++i] === "true"]);
+        break;
+      case "--arg-string-array":
+        opts.constructorArgs.push(["addStringArray", rest[++i].split(",")]);
+        break;
+      case "--arg-address-array":
+        opts.constructorArgs.push(["addAddressArray", rest[++i].split(",").map(a => toEvmAddress(a.trim()))]);
         break;
       default:
         throw new Error(`Unknown argument: ${token}`);
