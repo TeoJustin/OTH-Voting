@@ -11,15 +11,28 @@
  *   node call.js getResults
  *   node call.js vote 1 --as 2
  *   node call.js setVotingAllowed 0.0.10116894 true
+ *
+ * Account 1 comes from HEDERA_OPERATOR_ID / HEDERA_OPERATOR_KEY in .env.
+ * --as 2 uses HEDERA_OPERATOR_ID_2 / HEDERA_OPERATOR_KEY_2, and so on.
  */
 
 import fs from "node:fs";
+import "dotenv/config";
 import { ethers } from "ethers";
-import { ContractCallQuery, ContractExecuteTransaction, ContractId } from "@hashgraph/sdk";
-import { executeTransaction, makeTestnetClient, resolveAccountAddresses } from "./hedera.js";
+import {
+  AccountId,
+  Client,
+  ContractCallQuery,
+  ContractExecuteTransaction,
+  ContractId,
+  Hbar,
+  PrivateKey,
+  TransactionRecordQuery,
+} from "@hashgraph/sdk";
 
 const ABI_FILE = "Voting.json";
 const DEPLOYMENT_FILE = "deployment.json";
+const MIRROR_NODE = "https://testnet.mirrornode.hedera.com";
 const GAS = 300_000;
 
 function parseArgs(argv) {
@@ -46,10 +59,61 @@ function parseArgs(argv) {
   return opts;
 }
 
+/** DER, ECDSA hex, or ED25519 hex private key. */
+function parseKey(raw) {
+  const value = raw.trim();
+  for (const parse of [PrivateKey.fromStringDer, PrivateKey.fromStringECDSA, PrivateKey.fromStringED25519]) {
+    try {
+      return parse(value);
+    } catch {
+      // try the next encoding
+    }
+  }
+  throw new Error("Could not parse the private key. Expected a DER or raw ECDSA / ED25519 hex key.");
+}
+
+/** Account `slot` from .env: slot 1 is HEDERA_OPERATOR_ID/KEY, slot 2 is _2, and so on. */
+function makeClient(slot) {
+  const suffix = slot === 1 ? "" : `_${slot}`;
+  const id = process.env[`HEDERA_OPERATOR_ID${suffix}`];
+  const key = process.env[`HEDERA_OPERATOR_KEY${suffix}`];
+  if (!id || !key) {
+    throw new Error(
+      `Account ${slot} is not configured. Set HEDERA_OPERATOR_ID${suffix} and HEDERA_OPERATOR_KEY${suffix} in .env.`
+    );
+  }
+
+  const accountId = AccountId.fromString(id.trim());
+  const client = Client.forTestnet();
+  client.setOperator(accountId, parseKey(key));
+  client.setDefaultMaxTransactionFee(new Hbar(20));
+  client.setDefaultMaxQueryPayment(new Hbar(2));
+  return { client, accountId };
+}
+
+/**
+ * An account id can appear on-chain as two EVM addresses: the "long zero" form
+ * (account number padded to 20 bytes) and, for ECDSA accounts, an alias derived
+ * from the public key. msg.sender may be either, so resolve to the one it uses.
+ */
+async function resolveAddress(value) {
+  const input = value.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(input)) return input.toLowerCase();
+
+  const longZero = ("0x" + AccountId.fromString(input).toSolidityAddress()).toLowerCase();
+  try {
+    const response = await fetch(`${MIRROR_NODE}/api/v1/accounts/${input}`);
+    const alias = response.ok ? (await response.json()).evm_address : null;
+    if (alias && alias.toLowerCase() !== longZero) return alias.toLowerCase();
+  } catch {
+    // mirror node unreachable, fall back to the long zero address
+  }
+  return longZero;
+}
+
 /** Turn a CLI string into a value the ABI coder accepts. */
 async function coerce(type, raw) {
-  // accepts 0.0.x as well, resolved to the address msg.sender would carry
-  if (type === "address") return (await resolveAccountAddresses(raw))[0];
+  if (type === "address") return resolveAddress(raw);
   if (type === "bool") return raw.trim().toLowerCase() === "true";
   if (/^u?int\d*$/.test(type)) return BigInt(raw.trim());
   return raw;
@@ -77,6 +141,30 @@ function explainError(err, iface) {
   return message;
 }
 
+/**
+ * Execute a transaction and, when it reverts, attach the raw revert data.
+ * A failing receipt only reports CONTRACT_REVERT_EXECUTED; the revert data that
+ * identifies the custom error lives in the transaction record instead.
+ */
+async function executeTransaction(client, transaction) {
+  const response = await transaction.execute(client);
+  try {
+    const receipt = await response.getReceipt(client);
+    return { status: receipt.status.toString(), response };
+  } catch (err) {
+    try {
+      const record = await new TransactionRecordQuery()
+        .setTransactionId(response.transactionId)
+        .setValidateReceiptStatus(false)
+        .execute(client);
+      err.revertData = record.contractFunctionResult?.errorMessage ?? null;
+    } catch {
+      // the record is not available, keep the original error as is
+    }
+    throw err;
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv);
   const iface = new ethers.Interface(JSON.parse(fs.readFileSync(ABI_FILE, "utf8")).abi);
@@ -94,9 +182,8 @@ async function main() {
   const values = await Promise.all(fragment.inputs.map((input, i) => coerce(input.type, opts.args[i])));
   const callData = Buffer.from(iface.encodeFunctionData(fragment, values).slice(2), "hex");
 
-  // view and pure functions are free queries, everything else costs gas
   const isQuery = fragment.stateMutability === "view" || fragment.stateMutability === "pure";
-  const { client, accountId } = makeTestnetClient(opts.slot);
+  const { client, accountId } = makeClient(opts.slot);
 
   console.log(`Calling ${fragment.format("sighash")} on ${opts.contractId}`);
   console.log(`  as account : ${accountId.toString()} (slot ${opts.slot})`);

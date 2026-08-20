@@ -1,14 +1,11 @@
 {
-  "contractId": "0.0.10151154",
-  "deployedBy": "0.0.10103789",
-  "deployedAt": "2026-08-20T12:16:24.292Z",
+  "contractId": "0.0.10154409",
+  "deployedBy": "0.0.10116894",
+  "deployedAt": "2026-08-20T17:59:37.236Z",
   "topics": [
     "Pizza",
     "Pasta",
     "Salad"
   ],
-  "notAllowed": [
-    "0x4844b215fead62d66f2855ff0a81068662ec1b00",
-    "0x00000000000000000000000000000000009a5f1e"
-  ]
+  "notAllowed": []
 }

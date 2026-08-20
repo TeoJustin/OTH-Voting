@@ -14,18 +14,18 @@
  */
 
 import fs from "node:fs";
-import { ContractCreateFlow, ContractFunctionParameters } from "@hashgraph/sdk";
-import { makeTestnetClient, resolveAccountAddresses } from "./hedera.js";
+import "dotenv/config";
+import { AccountId, Client, ContractCreateFlow, ContractFunctionParameters, Hbar, PrivateKey } from "@hashgraph/sdk";
 
-const DEFAULT_ARTIFACT = "Voting.json";
+const ARTIFACT = "Voting.json";
 const DEPLOYMENT_FILE = "deployment.json";
+const MIRROR_NODE = "https://testnet.mirrornode.hedera.com";
 const GAS = 1_500_000;
 
-/** Split a comma separated list, treating "" as an empty list. */
 const splitList = (raw) => raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
 
 function parseArgs(argv) {
-  const opts = { artifact: DEFAULT_ARTIFACT, topics: null, notAllowed: null };
+  const opts = { artifact: ARTIFACT, topics: null, notAllowed: null };
 
   for (let i = 2; i < argv.length; i++) {
     const token = argv[i];
@@ -45,14 +45,7 @@ function parseArgs(argv) {
   return opts;
 }
 
-/**
- * Read the creation bytecode from the artifact.
- *
- * Accepts the compact form committed here ({ abi, bytecode }) and the full
- * artifact Remix exports ({ data: { bytecode: { object } } }). The runtime
- * bytecode is never used as a fallback: deploying it produces a contract that
- * reverts on every call.
- */
+/** Read the creation bytecode from the artifact ({ abi, bytecode } or Remix's full export). */
 function loadBytecode(artifact) {
   const candidate = artifact.bytecode ?? artifact.data?.bytecode?.object;
   const hex = (typeof candidate === "string" ? candidate : candidate?.object) ?? "";
@@ -64,20 +57,61 @@ function loadBytecode(artifact) {
   return stripped;
 }
 
+/** DER, ECDSA hex, or ED25519 hex private key. */
+function parseKey(raw) {
+  const value = raw.trim();
+  for (const parse of [PrivateKey.fromStringDer, PrivateKey.fromStringECDSA, PrivateKey.fromStringED25519]) {
+    try {
+      return parse(value);
+    } catch {
+      // try the next encoding
+    }
+  }
+  throw new Error("Could not parse the private key. Expected a DER or raw ECDSA / ED25519 hex key.");
+}
+
+function makeClient() {
+  const id = process.env.HEDERA_OPERATOR_ID;
+  const key = process.env.HEDERA_OPERATOR_KEY;
+  if (!id || !key) throw new Error("Set HEDERA_OPERATOR_ID and HEDERA_OPERATOR_KEY in your .env file.");
+
+  const accountId = AccountId.fromString(id.trim());
+  const client = Client.forTestnet();
+  client.setOperator(accountId, parseKey(key));
+  client.setDefaultMaxTransactionFee(new Hbar(20));
+  return { client, accountId };
+}
+
+/**
+ * An account id can appear on-chain as two EVM addresses: the "long zero" form
+ * (account number padded to 20 bytes) and, for ECDSA accounts, an alias derived
+ * from the public key. msg.sender may be either, so resolve both.
+ */
+async function resolveAddress(value) {
+  const input = value.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(input)) return [input.toLowerCase()];
+
+  const longZero = ("0x" + AccountId.fromString(input).toSolidityAddress()).toLowerCase();
+  try {
+    const response = await fetch(`${MIRROR_NODE}/api/v1/accounts/${input}`);
+    const alias = response.ok ? (await response.json()).evm_address : null;
+    if (alias && alias.toLowerCase() !== longZero) return [alias.toLowerCase(), longZero];
+  } catch {
+    // mirror node unreachable, fall back to the long zero address alone
+  }
+  return [longZero];
+}
+
 async function main() {
   const opts = parseArgs(process.argv);
   const artifact = JSON.parse(fs.readFileSync(opts.artifact, "utf8"));
   const bytecode = loadBytecode(artifact);
 
-  // an account id expands to every EVM address it can appear as, so the check
-  // against msg.sender matches whichever form Hedera uses for that account
   const addresses = [];
-  for (const entry of opts.notAllowed) {
-    addresses.push(...(await resolveAccountAddresses(entry)));
-  }
+  for (const entry of opts.notAllowed) addresses.push(...(await resolveAddress(entry)));
   const notAllowed = [...new Set(addresses)];
 
-  const { client, accountId } = makeTestnetClient(1);
+  const { client, accountId } = makeClient();
 
   console.log("Deploying Voting to Hedera Testnet ...");
   console.log(`  operator    : ${accountId.toString()}`);
@@ -85,8 +119,6 @@ async function main() {
   console.log(`  not allowed : ${JSON.stringify(notAllowed)}`);
 
   try {
-    // ContractCreateFlow uploads the bytecode to a file and creates the contract
-    // in one step, chunking automatically for large contracts
     const response = await new ContractCreateFlow()
       .setGas(GAS)
       .setBytecode(bytecode)

@@ -37,7 +37,6 @@ contract Voting {
     error NotAllowed(address caller);
     error InvalidTopicIndex(uint256 index);
     error NoTopicsGiven();
-    error NoVotesCast();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner(msg.sender);
@@ -102,24 +101,4 @@ contract Voting {
         }
     }
 
-    /// @notice the leading topic, plus whether another topic holds the same count
-    function getWinner()
-        external
-        view
-        returns (uint256 index, string memory name, uint256 voteCount, bool tied)
-    {
-        if (totalVotes == 0) revert NoVotesCast();
-
-        for (uint256 i = 0; i < _topics.length; ++i) {
-            uint256 votes = _topics[i].voteCount;
-            if (votes > voteCount) {
-                voteCount = votes;
-                index = i;
-                tied = false;
-            } else if (votes == voteCount && i != index) {
-                tied = true;
-            }
-        }
-        name = _topics[index].name;
-    }
 }
