@@ -11,7 +11,7 @@ from **several accounts**.
 | Call functions with multiple accounts | [`call.js --as N`](call.js) |
 | Topics defined by the constructor | `constructor(string[] topicNames, address[] notAllowedAccounts)` |
 | Everybody votes exactly once | `hasVoted` mapping, checked in `vote()` |
-| The result can be printed | `getResults()`, `getWinner()` |
+| The result can be printed | `getResults()`|
 | Accounts that are not allowed to vote | `notAllowedToVote` mapping, filled by the constructor |
 | The contract must be secure | see [Security notes](#security-notes) |
 
@@ -23,7 +23,6 @@ from **several accounts**.
 | `Voting.json` | ABI and bytecode, exported from the Solidity compiler |
 | `deploy.js` | Deploys the contract with its constructor arguments |
 | `call.js` | Calls any method, from any configured account |
-| `hedera.js` | Shared client, key parsing and address resolution |
 | `deployment.json` | Written by `deploy.js`, holds the current contract id |
 
 ## 1. Setup
